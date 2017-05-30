@@ -1,0 +1,401 @@
+\documentclass{article}
+\usepackage{graphicx}
+\usepackage{csvsimple}
+\usepackage{a4wide}
+\usepackage{pgfplots}
+\usepackage{amsmath}
+    % \pgfplotsset{width=7cm,compat=1.7}
+    % \pgfplotsset{every axis legend/.append style={
+    %     at={(0,0)},
+    %     anchor=north east}
+    % }
+
+% Style to select only points from #1 to #2 (inclusive)
+\pgfplotsset{select coords between index/.style 2 args={
+    x filter/.code={
+        \ifnum\coordindex<#1\def\pgfmathresult{}\fi
+        \ifnum\coordindex>#2\def\pgfmathresult{}\fi
+    }
+}}
+
+\begin{document}
+
+\title{Scientific and Parallel Computing \\ Parallelisation of the Mandelbrot Set}
+\author{Anis Jonischkeit}
+
+\maketitle
+
+\section{Introduction}
+    This report will focus on the task of parallelising the Mandelbrot set. I will be discussing my implementation of
+    two static task assignment approaches and one dynamic approach. This discussion will include relative implementation
+    details, problems I encountered as well as observations and comparisons between the nonParallel, static parallel, and dynamic
+    parallel implementations.
+
+\section{Implementation}
+    For this assignment I have completed two versions of Task 1 and one version of Task 2.
+
+    \subsection{Compiling and Running}
+        \subsubsection{Compiling}
+        To compile the program, run: mpicc -lX11 PROGRAM\textunderscore NAME.c -o PROGRAM\textunderscore NAME -g -lm. This will allow for debugging and will link the math library properly
+        \subsubsection{Running}
+        To run the program, run: mpirun -hostfile YOUR\textunderscore MACHINE\textunderscore FILE -np NUMBER\textunderscore OF\textunderscore PROCESSORS mandelbrot BOUNDARY\textunderscore LEVEL IMAGE\textunderscore WIDTH SCALLING\textunderscore FACTOR. Task2 has three additional
+        parameters:
+        \renewcommand{\labelitemi}{$\textendash$}
+        \begin{itemize}
+            \item STEP\textunderscore SIZE: the number of rows that a single processor should process at a time
+            \item INITIAL\textunderscore STEP\textunderscore SIZE: the number of rows that a single processor should process on a processors initial task
+            \item DEBUG: should be the characters '-d'. Starts the program in debug mode. for this to work you must have a VSCode environment with the debug native extension and you must set your username and password for the server in the setupDebugging function.
+        \end{itemize}
+        \hfill \break
+        NOTE: for all of the parallel programs, NUMBER\textunderscore OF\textunderscore PROCESSORS needs to be minimum 2
+    \subsection{Task 1}
+
+        \subsubsection{Attempt 1}
+            On my first attempt of Task 1 I decided to split the tasks evenly between the slaves so that each slave gets the 
+            \(total\textunderscore amount\textunderscore of\textunderscore pixels / number\textunderscore of\textunderscore slaves\).
+            So if there were 4 slaves then the first one would get the first quarter of image plane (split horizontaly not using 
+            recursive bisection)
+            \\
+            \\
+            I had the idea that the master shouldn't send out any data. Each processor could just
+            work out what it needs to do based on its rank and an algorithm that they each follow. This would remove one receive from all of the slaves
+            and number\textunderscore of\textunderscore slaves sends. The program that the master runs is just a for loop that has as many receives as there are slave 
+            processors. When master receives a buffer, it then draws the returned pixels to the screen translating the relative buffer
+            positions to absolute image positions (the start of the buffer will always be position 0 but we don't want to draw to position i for each item of
+            the returned buffer). There may be a few extra pixels that need to be drawn
+            at then end. This happens if the number of pixels to be drawn does not divide evenly among the number of processors. If this is the case then
+            the master will draw these at the end.
+            \\
+            \\
+            The slaves on the other hand will work out where the start and end of the chunk of pixels they need to process is. They will then
+            work out whether each of their allocated pixels belong to the mandelbrot set. if the number of pixels to be drawn does not divide
+            evenly among processors the first few processors will workout one extra pixel taken from the end of the image plane. After all pixels
+            have been calculated, the pixel values are sent back to the master
+
+        \subsubsection{Attempt 2}
+            They biggest problem that I found with Attempt1 was that the top and bottom sections would get done really quickly if the Boundary Level increases.
+            This happens since increasing the boundary level makes each processor do more calculations unless the specific pixel is clearly white. It is
+            generally quite quick to work out if a pixel is white, however it is always slow to work out whether a pixel is black. The tasks in the middle  would take a really
+            long amount of time to finish (since there are more black pixels in the middle than on the outside). I for Task1Attempt2 decided to split the image plane so that
+            every processor would have to process out every s\textsuperscript{th} row of pixels (where s is the number of slaves). This alone drastically increased the performance.
+            \\
+            \\
+            Another thing that is different is the fact that master now delegates the tasks that need to be done to the slaves (in preperation for dynamic task allocation)
+            using MPI\textunderscore Scatter. The master also holds on to which processors are doing what so that it can draw back to the right positions.
+            \\
+            \\
+            There is one major downside to the approach I chose for Attempt 2. Since master keeps track of what every processor does, if the imagewidth gets too big
+            the size of the array which master uses just gets too big causing a crash. A more elegant solution is implemented in Task 2.
+    
+    \subsection{Task 2}
+        I implemented Task to based on Task 1 Attempt 2 however I removed the big array that kept track of which row each processor was doing. Instead I replaced this with a 
+        very small state array which only keeps track of the first item of the last chunk that was allocated to a processor. I decided on making the program have two possible
+        sizes for the chunks. There is an initial size which is only used as the size for the first chunk of each processor. All subsequent chunks are then of a different set size. 
+        Having there be an initial chunk size can help in speeding communication as we don't send as many tasks (the initial chunk size should quite big). The default size for the initial
+        chunk is half of the total image size divided by the number of slaves.
+        Sending off half of the processes straight away is a good idea because it is very unlikely that a processor will take twice as long as the average time taken for all other processors to complete the task using dynamic task allocation 
+        (especially since we are giving quite a spread of items in our chunks). So if rank 3 finishes late, if it still finishes its section before the rest of the task is processed, then
+        it will only speed up the task. This cuts down communication a fair bit since we don't have to send as many different tasks (all of which would have the communication overhead).
+        \\
+        \\
+        After the first half of the data to be processed is sent of to the processors, dynamic task allocation occurs for the rest of the program. The dynamic task allocation goes as follows:
+        
+        \renewcommand{\labelitemi}{$\textendash$}
+        \begin{itemize}
+            \item The Master waits to receive a completed chunk from any slave
+            \item A slave finishes processing tasks and sends back the tasks he just worked on
+            \item The master takes those completed tasks and (if there are tasks left) allocates some new tasks to the slave. if no tasks are left a buffer starting with a value of -1 is returned to the slave
+            \item The master works on drawing the completed task and waits to receive more completed tasks (if there are any tasks still sitting on a slaves)
+
+            \item If there are no tasks left for the slaves to process, the master will send back a buffer with a value -1 as the first index (indicating to the slave that there is nothing left to do)
+        \end{itemize}
+
+
+\section{PCAM (Foster's Design Methodology)}
+    While undertaking the task, we were instructed to use the PCAM methodology. It is quite difficult to design a parallel program
+    if you don't have a logical methodology. In 1995, Ian Foster proposed the PCAM methodology, a four-stage design consisting of
+    these processes:
+
+    \begin{enumerate}  
+    \item Partitioning
+    \item Communication 
+    \item Agglomeration 
+    \item Mapping 
+    \end{enumerate}
+    
+    \subsection{Partitioning}
+        The goal of the partitioning stage is to break down the problem to find as much parallelism as possible. This stage is the only stage
+        in which we break down data and computations so we need to make sure to break down the problem as much as possible. There are two main 
+        ways in which we can break down our problem: 
+        
+        \begin{enumerate}  
+        \item Domain Decomposition
+        \item Functional Decomposition 
+        \end{enumerate}
+ 
+        \subsubsection{Domain Decomposition}
+            Domain decomposition deals with decomposing the data into many small pieces to which parallel computations can be applied.
+            In the case of the mandelbrot set, each point on the plane that needs to be calculated can be calculated independently of 
+            anything else. All we need to know about the particular point is the position of it on the plane. This makes the points on the 
+            plane perfect candidates for domain decomposition.
+
+        \subsubsection{Functional Decomposition}
+            Functional decomposition is the process of partitioning computations that need to be performed. I could only think of one example
+            of functional parallelism for the task, that is the task of drawing the points to the XServer. Due to the limitation that only
+            rank 0 can communicate to the XServer, this is an interesting observation but useless for our program implementation.
+    
+    \subsection{Communication}
+        Once the program has been partitioned, we need to look at the communication that will occur between processors. In most parallel programs
+        there needs to be some sort of communication since all processors are trying to achieve the same task. While communication is very useful,
+        we must make sure to minimise communicate as much as is reasonable since it is generally far slower than computation.
+
+        \subsubsection{Global Communication}
+            A global communication operation is one in which many tasks must participate. My implementation of the parallel mandelbrot set uses global
+            communication since all of the processors must talk to the master, they don't talk with one another. Although global communication
+            can be slower since everyone has to wait for the master, a local communication approach would not have worked for
+            the reason that all of the data has to come back to the master anyway to be drawn, so passing it along to a neighbour process would be 
+            completely unnecessary and a waste of communication. 
+        
+        \subsubsection{Unstructured and Dynamic Communication}
+            The dynamic version of the task Part2Attempt2 has both an unstructured and a dynamic part to it. The program works by first dividing half of the
+            tasks between the slaves. The master slave will receive tasks from any process and send back tasks to processors that have finished their tasks.
+
+        \subsubsection{Other Implementation Ideas}
+            An idea I had started to play with was a divide and conquer strategy for dynamic task allocation. With this strategy, the master would
+            assign tasks to two nodes, who would then assign further tasks to two more nodes each. This would eleviate the stress on rank0 to 
+            handle too many MPI\textunderscore Sends at the same time. This approach however would still have the problem where only the master can draw to XServer
+            so there would still be a delay of the master drawing and not receiving anything.
+            \\
+            \\
+            The solution for this problem would obviously be to make the processes asynchronous. I would have loved to have tried these options however with 
+            the time restrictions this sadly wasn't possible.
+    
+    \subsection{Agglomeration}
+        Agglomeration deals with combining tasks in order to reduce communication. I was very mindful of this throughout the project. In Task1Attempt1 I decided
+        to trade off replicated computation for reduced communication. I did this by not sending out any tasks to the processors and instead letting each processor
+        deterimine for itself, what it needs to calculate (this is based on each processor's rank and the number of pixels to be processed). In the second attempt of
+        task 1 I decided to get rid of this mechanism purely because it is only applicable to the first allocation (the non-dynamic). I decided that the extra time it would
+        take to replicate this with the dynamic task allocation just wasn't worth it for the n-1 sends that would be saved (n is the number of processors). I also decided to
+        not send tasks one by one (pixel by pixel or row by row). Instead I opted for a chunk of some size of rows to be sent.
+    
+    \subsection{Mapping}
+        For Task1Attempt1, I used a bisection approach to split up the tasks. This approach split the image plane into as many sections as there are slave processors.
+        Each section starts at: \[(rank - 1) * \dfrac{pixels}{(size - 1)}\] and ends at: \[rank * \dfrac{pixels}{size - 1}\]
+        \\
+        \\
+        In Task1Attempt2 and Task2 the image plane was split by rows so that each processor would get allocated tasks following the pattern \([(row_{i}), (row_{i+1} + slaves), (row_{i+2} + 2 * slaves), (...), (row_{i+j} + j * slaves)]\)
+        where i is the first row number to be processed and slaves is the number of slaves. In task1Attempt2 this was just done once with all of the rows (tasks), so all tasks were distributed in one go.
+        In Task 2 however, this happens for half of the available rows. Then for the second half dynamic task allocation is used and each processor gets assigned a list of tasks following the same pattern (the amount of tasks
+        that each processor gets allocated can be changed at execution time).
+
+
+\section{Analysis of Results}
+    In order to get full accurate testing data, I wrote a python script that would run the Mandelbrot programs multiple times with different configurations set.
+    To try to avoid outliers in our data, each configuration was run on a program three times and the median of those was taken (we take the median instead of the
+    mean since we don't have a large enough sample size). The programs were only run three times per configuration, purely because of the fact that doing this already
+    took roughly an hour and I didn't want to throttle the cluster for too long. The results of the runs can be seen below.
+
+    \subsection{Runtimes for different numbers of processors and Boundary Levels}
+        \footnotesize
+        \csvautotabular{data2.csv}
+
+        \begin{tikzpicture}
+            \begin{axis}[
+                title=Mandelbrot Set Completion Time at -100 Boundary,
+                legend pos=north west,
+                axis lines=middle,
+                axis line style={->},
+                x label style={at={(axis description cs:0.5,-0.1)},anchor=north},
+                y label style={at={(axis description cs:-0.1,.5)},rotate=90,anchor=south},
+                xlabel={Number of Processors},
+                ylabel={Time Taken}]
+            ]
+                \addplot [select coords between index={0}{14}][color=red] table [x=Processors, y=Part 2, col sep=comma] {data2.csv};
+                \addplot [select coords between index={0}{14}][color=green]  table [x=Processors, y=Part 1 Attempt 2, col sep=comma] {data2.csv};
+                \addplot [select coords between index={0}{14}][color=blue] table [x=Processors, y=Part 1 Attempt 1, col sep=comma] {data2.csv};
+                \addplot [select coords between index={0}{14}][color=brown] table [x=Processors, y=Un-Parallel, col sep=comma] {data2.csv};
+                \legend{$Part 2$,$Part 1 Attempt 2$,$Part 1 Attempt 1$,$Un-Parallel$}
+            \end{axis}
+        \end{tikzpicture}
+
+        \hfill \break
+        In the first line graph you can see that the Un-Parallel algorithm is actually the fastest for the majority of the time. This is
+        Because there is so little information to process that communication slows the task down too much. When you have too small of a problem
+        a parallel algorithm can just slow you down.
+        \hfill \break
+        
+        \begin{tikzpicture}
+            \begin{axis}[
+                title=Mandelbrot Set Completion Time at -1000 Boundary,
+                legend pos=north west,
+                axis lines=middle,
+                axis line style={->},
+                x label style={at={(axis description cs:0.5,-0.1)},anchor=north},
+                y label style={at={(axis description cs:-0.1,.5)},rotate=90,anchor=south},
+                xlabel={Number of Processors},
+                ylabel={Time Taken}]
+            ]
+                \addplot [select coords between index={15}{29}][color=red] table [x=Processors, y=Part 2, col sep=comma] {data2.csv};
+                \addplot [select coords between index={15}{29}][color=green]  table [x=Processors, y=Part 1 Attempt 2, col sep=comma] {data2.csv};
+                \addplot [select coords between index={15}{29}][color=blue] table [x=Processors, y=Part 1 Attempt 1, col sep=comma] {data2.csv};
+                \addplot [select coords between index={15}{29}][color=brown] table [x=Processors, y=Un-Parallel, col sep=comma] {data2.csv};
+                \legend{$Part 2$,$Part 1 Attempt 2$,$Part 1 Attempt 1$,$Un-Parallel$}
+            \end{axis}
+        \end{tikzpicture}
+
+        \hfill \break
+        In this line graph you can start to see how the parallel algorithms are now overtaking the Un-Parallel algorithm initially. They do however become 
+        slower when too many processors are used (again due to there being too much communication for the size of the task).
+        \hfill \break
+
+        \begin{tikzpicture}
+            \begin{axis}[
+                title=Mandelbrot Set Completion Time at -10000 Boundary,
+                legend pos=north east,
+                axis lines=middle,
+                axis line style={->},
+                x label style={at={(axis description cs:0.5,-0.1)},anchor=north},
+                y label style={at={(axis description cs:-0.1,.5)},rotate=90,anchor=south},
+                xlabel={Number of Processors},
+                ylabel={Time Taken}]
+            ]
+                \addplot [select coords between index={30}{44}][color=red] table [x=Processors, y=Part 2, col sep=comma] {data2.csv};
+                \addplot [select coords between index={30}{44}][color=green]  table [x=Processors, y=Part 1 Attempt 2, col sep=comma] {data2.csv};
+                \addplot [select coords between index={30}{44}][color=blue] table [x=Processors, y=Part 1 Attempt 1, col sep=comma] {data2.csv};
+                \addplot [select coords between index={30}{44}][color=brown] table [x=Processors, y=Un-Parallel, col sep=comma] {data2.csv};
+                \legend{$Part 2$,$Part 1 Attempt 2$,$Part 1 Attempt 1$,$Un-Parallel$}
+            \end{axis}
+        \end{tikzpicture}
+
+        \hfill \break
+        Having now marginally increased the boundary level, you can clearly see that all of the Parallel programs outperform the Un-Parallel
+        one. The fastest program quickly becomes the Dynamically allocated one. Interestingly though, Part1Attempt2 starts of being much quicker than
+        Part1Attempt1 however slowly enough Part1Attempt1 overtakes Part1Attempt2. The reason why Part1Attempt2 is quicker initially is because the tasks
+        are more evenly divided with the amount of work that needs to be done on them. When more processors are used however, the advantage that the
+        evenly dividing does becomes a lot smaller. It in fact becomes small enough that the advantage of Part1Attempt1 not having to delegate tasks from
+        the master to the slaves is enough to make it faster than Part1Attempt2.
+        \hfill \break
+
+        \begin{tikzpicture}
+            \begin{axis}[
+                title=Mandelbrot Set Completion Time at -100000 Boundary,
+                legend pos=north east,
+                axis lines=middle,
+                axis line style={->},
+                x label style={at={(axis description cs:0.5,-0.1)},anchor=north},
+                y label style={at={(axis description cs:-0.1,.5)},rotate=90,anchor=south},
+                xlabel={Number of Processors},
+                ylabel={Time Taken}]
+            ]
+                \addplot [select coords between index={45}{59}][color=red] table [x=Processors, y=Part 2, col sep=comma] {data2.csv};
+                \addplot [select coords between index={45}{59}][color=green]  table [x=Processors, y=Part 1 Attempt 2, col sep=comma] {data2.csv};
+                \addplot [select coords between index={45}{59}][color=blue] table [x=Processors, y=Part 1 Attempt 1, col sep=comma] {data2.csv};
+                \addplot [select coords between index={45}{59}][color=brown] table [x=Processors, y=Un-Parallel, col sep=comma] {data2.csv};
+                \legend{$Part 2$,$Part 1 Attempt 2$,$Part 1 Attempt 1$,$Un-Parallel$}
+            \end{axis}
+        \end{tikzpicture}
+
+        \hfill \break
+        The pattern of the parallel programs leaving the Un-Parallel one behind continues on from the previous graphs.
+
+    \subsection{Runtimes for different numbers of processors and Image Widths}
+        \footnotesize
+        \csvautotabular{data.csv}
+
+        \begin{tikzpicture}
+            \begin{axis}[
+                title=Mandelbrot Set Completion Time at 1000 Width,
+                legend pos=north west,
+                axis lines=middle,
+                axis line style={->},
+                x label style={at={(axis description cs:0.5,-0.1)},anchor=north},
+                y label style={at={(axis description cs:-0.1,.5)},rotate=90,anchor=south},
+                xlabel={Number of Processors},
+                ylabel={Time Taken}]
+            ]
+                \addplot [select coords between index={0}{14}][color=red] table [x=Processors, y=Part 2, col sep=comma] {data.csv};
+                \addplot [select coords between index={0}{14}][color=green]  table [x=Processors, y=Part 1 Attempt 2, col sep=comma] {data.csv};
+                \addplot [select coords between index={0}{14}][color=blue] table [x=Processors, y=Part 1 Attempt 1, col sep=comma] {data.csv};
+                \addplot [select coords between index={0}{14}][color=brown] table [x=Processors, y=Un-Parallel, col sep=comma] {data.csv};
+                \legend{$Part 2$,$Part 1 Attempt 2$,$Part 1 Attempt 1$,$Un-Parallel$}
+            \end{axis}
+        \end{tikzpicture}
+
+        \hfill \break
+        This time you can see straight away that the parallel algorithms are already predominantly ahead.
+        \hfill \break
+
+        \begin{tikzpicture}
+            \begin{axis}[
+                title=Mandelbrot Set Completion Time at 2000 Width,
+                legend pos=north west,
+                axis lines=middle,
+                axis line style={->},
+                x label style={at={(axis description cs:0.5,-0.1)},anchor=north},
+                y label style={at={(axis description cs:-0.1,.5)},rotate=90,anchor=south},
+                xlabel={Number of Processors},
+                ylabel={Time Taken}]
+            ]
+                \addplot [select coords between index={15}{29}][color=red] table [x=Processors, y=Part 2, col sep=comma] {data.csv};
+                \addplot [select coords between index={15}{29}][color=blue] table [x=Processors, y=Part 1 Attempt 1, col sep=comma] {data.csv};
+                \addplot [select coords between index={15}{29}][color=brown] table [x=Processors, y=Un-Parallel, col sep=comma] {data.csv};
+                \legend{$Part 2$,$Part 1 Attempt 1$,$Un-Parallel$}
+            \end{axis}
+        \end{tikzpicture}
+
+        \hfill \break
+        At this stage you can see that the Un-Parallel program is far behind both of the parallel programs. Notice also that Part1Attempt2 was
+        not able to be drawn since too much memory was used by the program making it crash.
+        \hfill \break
+
+        \begin{tikzpicture}
+            \begin{axis}[
+                title=Mandelbrot Set Completion Time at 3000 Width,
+                legend pos=north west,
+                axis lines=middle,
+                axis line style={->},
+                x label style={at={(axis description cs:0.5,-0.1)},anchor=north},
+                y label style={at={(axis description cs:-0.1,.5)},rotate=90,anchor=south},
+                xlabel={Number of Processors},
+                ylabel={Time Taken}]
+            ]
+                \addplot [select coords between index={30}{44}][color=red] table [x=Processors, y=Part 2, col sep=comma] {data.csv};
+                \addplot [select coords between index={30}{44}][color=blue] table [x=Processors, y=Part 1 Attempt 1, col sep=comma] {data.csv};
+                \addplot [select coords between index={30}{44}][color=brown] table [x=Processors, y=Un-Parallel, col sep=comma] {data.csv};
+                \legend{$Part 2$,$Part 1 Attempt 1$,$Un-Parallel$}
+            \end{axis}
+        \end{tikzpicture}
+
+        \hfill \break
+        The Unparallel program gets even further behind both of the parallel programs. 
+        \hfill \break
+
+        \begin{tikzpicture}
+            \begin{axis}[
+                title=Mandelbrot Set Completion Time at 4000 Width,
+                legend pos=north west,
+                axis lines=middle,
+                axis line style={->},
+                x label style={at={(axis description cs:0.5,-0.1)},anchor=north},
+                y label style={at={(axis description cs:-0.1,.5)},rotate=90,anchor=south},
+                xlabel={Number of Processors},
+                ylabel={Time Taken}]
+            ]
+                \addplot [select coords between index={45}{59}][color=red] table [x=Processors, y=Part 2, col sep=comma] {data.csv};
+                \addplot [select coords between index={45}{59}][color=blue] table [x=Processors, y=Part 1 Attempt 1, col sep=comma] {data.csv};
+                \addplot [select coords between index={45}{59}][color=brown] table [x=Processors, y=Un-Parallel, col sep=comma] {data.csv};
+                \legend{$Part 2$,$Part 1 Attempt 1$,$Un-Parallel$}
+            \end{axis}
+        \end{tikzpicture}
+
+        \subsection{Findings}
+            One of the key things that I have learned from this is the fact that the communication can really be the difference between a faster
+            and slower program. Notice how in the first few graphs the time taken goes down until it hits some point and then starts going back up.
+            I believe that this is due to the larger and larger amounts of communication that is needed for handling more processors. You
+            don't see the decrease of speed in the last two graphs, I do however believe that if we had more processors running the program, it would
+            at some stage decreasing in speed.
+
+        
+
+
+\end{document}
